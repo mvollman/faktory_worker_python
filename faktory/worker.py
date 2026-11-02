@@ -1,6 +1,8 @@
 import logging
 import signal
+import socketserver
 import sys
+import threading
 import time
 import uuid
 from collections import namedtuple
@@ -52,6 +54,10 @@ class Worker:
         :type labels: tuple
         :param use_threads: Set to True to use threads rather than multiple processes for work to be executed on
         :type use_threads: bool
+        :param status_port: If set, listen on this local TCP port and reply to each connection with the number of running jobs
+        :type status_port: int
+        :param status_host: interface for the status socket to bind to (default 127.0.0.1)
+        :type status_host: str
         :param executor: Set the class of the process executor that will be used. By default concurrenct.futures.ProcessPoolExecutor is used.
         :type executor: class
         """
@@ -71,6 +77,9 @@ class Worker:
             if kwargs.pop("use_threads", False)
             else ProcessPoolExecutor,
         )
+        self._status_port = kwargs.pop("status_port", None)
+        self._status_host = kwargs.pop("status_host", "127.0.0.1")
+        self._status_server = None
         self._last_heartbeat = None
         self._tasks = dict()
         self._pending = list()
@@ -155,6 +164,8 @@ class Worker:
             seconds=self.send_heartbeat_every
         )  # schedule a heartbeat for the future
 
+        self._start_status_server()
+
         self.log.info("Queues: {}".format(", ".join(self.get_queues())))
         self.log.info("Labels: {}".format(", ".join(self.faktory.labels)))
 
@@ -183,8 +194,44 @@ class Worker:
             self.log.warning("Forcing worker processes to shutdown...")
             self.disconnect(force=True)
 
+        self._stop_status_server()
         self.executor.shutdown(wait=False)
         sys.exit(1)
+
+    @property
+    def running_jobs(self) -> int:
+        """Number of jobs currently executing (submitted and not yet finished)."""
+        return sum(1 for f in list(self._pending) if not f.done())
+
+    def _start_status_server(self):
+        if self._status_port is None or self._status_server is not None:
+            return
+
+        worker = self
+
+        class Handler(socketserver.BaseRequestHandler):
+            def handle(self):
+                self.request.sendall("{}\n".format(worker.running_jobs).encode())
+
+        socketserver.ThreadingTCPServer.allow_reuse_address = True
+        self._status_server = socketserver.ThreadingTCPServer(
+            (self._status_host, self._status_port), Handler
+        )
+        self._status_server.daemon_threads = True
+        threading.Thread(
+            target=self._status_server.serve_forever, daemon=True
+        ).start()
+        self.log.info(
+            "Status socket listening on {}:{}".format(
+                self._status_host, self._status_server.server_address[1]
+            )
+        )
+
+    def _stop_status_server(self):
+        if self._status_server is not None:
+            self._status_server.shutdown()
+            self._status_server.server_close()
+            self._status_server = None
 
     def disconnect(self, force=False, wait=30):
         """
